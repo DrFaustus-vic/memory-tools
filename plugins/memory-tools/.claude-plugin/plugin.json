@@ -1,8 +1,10 @@
 {
   "name": "memory-tools",
+  "displayName": "Memory Tools",
   "description": "Lightweight suite of skills for managing memory on Claude Code.",
   "version": "0.2.0",
   "author": { "name": "VictorZ" },
   "license": "MIT",
+  "repository": "https://github.com/DrFaustus-vic/memory-tools",
   "keywords": ["memory", "compact", "MEMORY.md", "maintenance", "context"]
 }
