@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Internal dev artifacts — not shipped to the public repo
+docs/
+
+# Session transcript / export dumps — may contain private memory content; never commit
+*local-command-caveat*
+*-the-messages-below.txt

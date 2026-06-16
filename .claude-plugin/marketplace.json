@@ -1,0 +1,12 @@
+{
+  "name": "memory-tools",
+  "description": "Lightweight suite of skills for managing memory on Claude Code.",
+  "owner": { "name": "VictorZ" },
+  "plugins": [
+    {
+      "name": "memory-tools",
+      "source": "./plugins/memory-tools",
+      "description": "Lightweight suite of skills for managing memory on Claude Code."
+    }
+  ]
+}

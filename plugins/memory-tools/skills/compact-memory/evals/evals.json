@@ -1,0 +1,45 @@
+{
+  "skill_name": "compact-memory",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "My MEMORY.md is over its size limit and has duplicate entries. /compact-memory",
+      "expected_output": "Runs the analyzer, previews a plan that merges duplicates and shrinks the index under both the 200-line and 25KB limits, waits for approval before writing, then reports a measured before>after index size."
+    },
+    {
+      "id": 2,
+      "prompt": "/compact-memory be conservative",
+      "expected_output": "Only obvious duplicates and explicitly-SUPERSEDED entries are retired; near-duplicates and stale-by-date entries are left in place."
+    },
+    {
+      "id": 3,
+      "prompt": "/compact-memory index only",
+      "expected_output": "No files are retired or merged; only long index lines are shortened (detail relocated into topic files) to bring MEMORY.md under budget."
+    },
+    {
+      "id": 4,
+      "prompt": "/compact-memory keep all dev-ticket evidence",
+      "expected_output": "Entries about dev tickets / evidence are protected from retirement even if they look stale; other consolidation proceeds."
+    },
+    {
+      "id": 5,
+      "prompt": "A memory file has malformed YAML frontmatter. /compact-memory",
+      "expected_output": "The malformed file is surfaced in the plan (not silently dropped); the run continues and the file is preserved."
+    },
+    {
+      "id": 6,
+      "prompt": "My memory store is already small and clean. /compact-memory",
+      "expected_output": "Reports that the store is already under budget with nothing to consolidate (no-op), optionally fixing any orphan pointers or broken links."
+    },
+    {
+      "id": 7,
+      "prompt": "After /compact-memory, confirm nothing was permanently lost.",
+      "expected_output": "Retired files are present under the sibling memory-archive/ with tombstones; a pre-run snapshot exists; nothing was hard-deleted."
+    },
+    {
+      "id": 8,
+      "prompt": "After /compact-memory archived some entries, verify they cannot bleed back into recall.",
+      "expected_output": "The structural guarantee holds: retired files live in the sibling memory-archive/ (outside memory/) AND their MEMORY.md pointers are removed, so neither the directory scan nor the index can surface them. The model may note that an optional one-time cross-session sentinel check (a marker in the archive that must never appear in a fresh session's recall) is described in the plugin README."
+    }
+  ]
+}
