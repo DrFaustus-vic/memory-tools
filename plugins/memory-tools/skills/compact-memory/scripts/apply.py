@@ -42,67 +42,26 @@ import json
 import sys
 from pathlib import Path
 
+# Bootstrap: add lib/ to sys.path so memory_core is importable (mirrors analyze_memory.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "lib"))
+import memory_core as mc  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analyze_memory as am  # noqa: E402
 
-_RESERVED = ({"con", "prn", "aux", "nul"}
-             | {"com%d" % i for i in range(1, 10)} | {"lpt%d" % i for i in range(1, 10)})
-
-
-def read_bytes(p):
-    return Path(p).read_bytes()
-
-
-def read_text(p):
-    return Path(p).read_bytes().decode("utf-8", errors="replace")
-
-
-def write_text(p, s):
-    Path(p).write_bytes(s.encode("utf-8"))  # bytes I/O -> no platform newline conversion
-
-
-def write_bytes(p, b):
-    Path(p).write_bytes(b)
-
-
-def _line_target(line):
-    # Mirror analyze_memory.parse_index exactly: a bullet line containing a markdown link;
-    # target = the link's basename. Using the SAME matcher as the analyzer means apply drops
-    # precisely what the analyzer counts as a pointer — so no dangling/orphan pointer is left.
-    if not line or not line.lstrip().startswith(("-", "*")):
-        return None
-    m = am.INDEX_LINK_RE.search(line)
-    return m.group(2).split("/")[-1] if m else None
-
-
-def _file_norms(filename, body):
-    norms = {am._norm_link(Path(filename).stem)}
-    name = am.parse_frontmatter(body).get("name")
-    if name:
-        norms.add(am._norm_link(name))
-    return norms
-
-
-def _require(cond, msg):
-    if not cond:
-        raise SystemExit("apply: " + msg)
-
-
-def _safe_name(name):
-    """A manifest filename must be a bare, unambiguous filename — no path separators / '..'
-    / absolute, no trailing space or dot (Windows strips these -> aliasing), no control
-    chars or ':' (ADS / drive), and not a reserved device name."""
-    if not isinstance(name, str) or not name or name in (".", ".."):
-        raise SystemExit("apply: unsafe filename: %r" % (name,))
-    if name != Path(name).name:
-        raise SystemExit("apply: filename must be bare (no path separators): %r" % (name,))
-    if name != name.rstrip(" ."):
-        raise SystemExit("apply: filename has a trailing space or dot: %r" % (name,))
-    if ":" in name or any(ord(c) < 0x20 for c in name):
-        raise SystemExit("apply: filename has an illegal character: %r" % (name,))
-    if name.split(".")[0].lower() in _RESERVED:
-        raise SystemExit("apply: reserved device name: %r" % (name,))
-    return name
+# Re-export the names that _validate (and any callers) expect directly from this module.
+_RESERVED = mc._RESERVED
+read_bytes = mc.read_bytes
+read_text = mc.read_text
+write_text = mc.write_text
+write_bytes = mc.write_bytes
+_require = mc._require
+_safe_name = mc._safe_name
+_file_norms = mc._file_norms
+_line_target = mc._line_target
+archive_file = mc.archive_file
+rewrite_index = mc.rewrite_index
+fix_inbound_links = mc.fix_inbound_links
 
 
 def _validate(memory_dir, manifest):
@@ -210,26 +169,21 @@ def apply_plan(memory_dir, manifest, dry_run=False):
     # 2. Archive each gone file (tombstone + RAW original bytes), VERIFY, THEN delete.
     readme_entries = []
     for fn, info in gone.items():
-        dst = archive / fn
-        if dst.exists():   # never overwrite an older archived copy of a same-named file
-            stem, suf, i = Path(fn).stem, Path(fn).suffix, 1
-            while (archive / ("%s.%d%s" % (stem, i, suf))).exists():
-                i += 1
-            dst = archive / ("%s.%d%s" % (stem, i, suf))
-        _require(not dst.is_symlink(), "archive target is a symlink: %s (refusing)" % dst.name)
-        orig_note = "" if dst.name == fn else " (orig %s)" % fn
         if info["action"] == "retire":
-            tomb = "> RETIRED %s — %s\n\n" % (date, info["reason"])
-            readme_entries.append("- `%s` — retired %s%s" % (dst.name, date, orig_note))
+            tombstone = "> RETIRED %s — %s\n\n" % (date, info["reason"])
+        else:
+            tombstone = "> MERGED %s into %s. Original preserved below.\n\n" % (date, info["canon_stem"])
+
+        stored_name = archive_file(archive, fn, tombstone, info["raw"], memory_dir / fn)
+
+        orig_note = "" if stored_name == fn else " (orig %s)" % fn
+        if info["action"] == "retire":
+            readme_entries.append("- `%s` — retired %s%s" % (stored_name, date, orig_note))
             summary["retired"].append(fn)
         else:
-            tomb = "> MERGED %s into %s. Original preserved below.\n\n" % (date, info["canon_stem"])
-            readme_entries.append("- `%s` — merged into %s %s%s" % (dst.name, info["canon_stem"], date, orig_note))
+            readme_entries.append("- `%s` — merged into %s %s%s" % (stored_name, info["canon_stem"], date, orig_note))
             summary["absorbed"].append(fn)
-        content = tomb.encode("utf-8") + info["raw"]
-        write_bytes(dst, content)
-        _require(read_bytes(dst) == content and dst.resolve() != (memory_dir / fn).resolve(),
-                 "archive copy invalid for %s; original NOT deleted" % fn)
+
         (memory_dir / fn).unlink()
 
     # 3. Fix inbound [[wikilinks]] in surviving files. Two passes over memory/: first gather
@@ -246,32 +200,14 @@ def apply_plan(memory_dir, manifest, dry_run=False):
             continue
         survivor_norms |= _file_norms(p.name, read_text(p))
 
-    def _repl(mo):
-        n = am._norm_link(mo.group(1))
-        if n in survivor_norms:
-            return mo.group(0)
-        for info in gone.values():
-            if n in info["norms"]:
-                return ("%s (archived)" % mo.group(1)) if info["action"] == "retire" \
-                    else ("[[%s]]" % info["canon_stem"])
-        return mo.group(0)
-
-    for p in sorted(memory_dir.glob("*.md")):
-        if p.name == am.INDEX_FILE or p.name in canon_files:
-            continue
-        t = read_text(p)
-        nt = am.WIKILINK_RE.sub(_repl, t)
-        if nt != t:
-            write_text(p, nt)
-            summary["inbound_fixed"].append(p.name)
+    summary["inbound_fixed"] = fix_inbound_links(
+        memory_dir, gone, survivor_norms, skip_files=canon_files)
 
     # 4. Rewrite MEMORY.md — surgical, per-line, EOL-preserving.
     index_path = memory_dir / am.INDEX_FILE
     if index_path.exists():
         raw = read_text(index_path)
-        lines = raw.splitlines(keepends=True)
-        default_nl = "\r\n" if "\r\n" in raw else "\n"
-        present = [_line_target(ln) for ln in lines]
+        present = [_line_target(ln) for ln in raw.splitlines(keepends=True)]
         # place each merge's canonical line at the EARLIEST absorbed present in the index; else append
         merge_anchor, appended = {}, []
         for m in merges:
@@ -281,28 +217,17 @@ def apply_plan(memory_dir, manifest, dry_run=False):
             else:
                 appended.append(m["canonical_index_line"])
         shorten_map = {s["file"]: s["new_index_line"] for s in shorten}
-        out, emitted = [], set()
-        for ln in lines:
-            tgt = _line_target(ln)
-            term = ln[len(ln.rstrip("\r\n")):] or default_nl
-            if tgt in merge_anchor:
-                if tgt not in emitted:           # emit each canonical line once; a duplicate
-                    out.append(merge_anchor[tgt] + term)   # pointer to the same absorbed file
-                    emitted.add(tgt)             # is dropped (its file is gone) — no dup line
-            elif tgt in gone:
-                continue
-            elif tgt in shorten_map:
-                if tgt not in emitted:           # shorten each pointer once; a duplicate
-                    out.append(shorten_map[tgt] + term)   # pointer to the same live file is
-                    summary["shortened"].append(tgt)      # dropped (one pointer per file)
-                    emitted.add(tgt)
-            else:
-                out.append(ln)
-        if appended and out and not out[-1].endswith(("\n", "\r")):
-            out[-1] = out[-1] + default_nl   # terminate the last retained line before appending
-        for cl in appended:
-            out.append(cl + default_nl)
-        write_text(index_path, "".join(out))
+        # replace = merge anchors (emitted at first absorbed pointer) + shorten replacements
+        # drop   = all gone files (merge anchors are in replace so fire first; absorbed
+        #          non-anchors and retired files are only in drop)
+        replace = dict(merge_anchor)
+        replace.update(shorten_map)
+        rewrite_index(index_path, drop=set(gone), replace=replace, append=appended)
+        # Track which files were actually shortened (those whose pointer was replaced).
+        # We re-read the present list to determine which shorten targets were in the index.
+        for fn in shorten_map:
+            if fn in present:
+                summary["shortened"].append(fn)
 
     # 5. Append the archive README audit block.
     readme = archive / "README.md"

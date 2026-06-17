@@ -7,81 +7,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import sys
 from collections import Counter
 from pathlib import Path
 
-INDEX_FILE = "MEMORY.md"
-INDEX_LINE_LIMIT = 200          # harness loads first 200 lines of MEMORY.md
-INDEX_BYTE_LIMIT = 25_000       # ...or first ~25KB, whichever comes first
-LONG_ENTRY_CHARS = 200          # index lines longer than this are flagged
-LONG_ENTRY_BYTES = 300          # index lines with more UTF-8 bytes than this are flagged
-STALE_MARKERS = ("SUPERSEDED", "DEPRECATED", "OBSOLETE")
-MIN_SHARED_TOKENS = 2
-STOPWORDS = {
-    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are",
-    "with", "via", "not", "use", "when", "md", "new", "old",
-}
+# Ensure the plugin-level lib/ dir is importable when this script is run
+# directly as a subprocess (conftest adds it for in-process pytest runs).
+_LIB = Path(__file__).resolve().parent.parent.parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
 
-KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-INDEX_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
-TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def parse_frontmatter(text):
-    result = {"name": None, "description": None, "type": None,
-              "schema_variant": "none", "name_style": None, "warnings": []}
-    # FIX M3: strip a leading UTF-8 BOM so "---" detection works
-    if text.startswith("﻿"):
-        text = text[1:]
-    if not text.startswith("---"):
-        result["warnings"].append("no_frontmatter")
-        return result
-    lines = text.splitlines()
-    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
-    if end is None:
-        result["warnings"].append("unterminated_frontmatter")
-        return result
-    in_metadata = False
-    for raw in lines[1:end]:
-        if not raw.strip():
-            continue
-        indented = raw[:1].isspace()
-        stripped = raw.strip()
-        if stripped[:-1].strip() == "metadata" and stripped.endswith(":"):
-            in_metadata = True
-            continue
-        if ":" not in stripped:
-            result["warnings"].append("unparsed_line:" + stripped[:40])
-            continue
-        key, _, val = stripped.partition(":")
-        key, val = key.strip(), val.strip().strip('"').strip("'")
-        if indented and in_metadata:
-            # FIX M2: capture name and description from nested block too
-            if key == "type" and result["type"] is None:
-                result["type"] = val
-                result["schema_variant"] = "nested"
-            elif key == "name" and result["name"] is None:
-                result["name"] = val
-            elif key == "description" and result["description"] is None:
-                result["description"] = val
-            continue
-        in_metadata = False
-        if key == "name":
-            result["name"] = val
-        elif key == "description":
-            result["description"] = val
-        elif key == "type":
-            result["type"] = val
-            result["schema_variant"] = "flat"
-    if result["name"]:
-        result["name_style"] = "kebab" if KEBAB_RE.match(result["name"]) else "human"
-    if result["type"] is None:
-        result["warnings"].append("no_type")
-    return result
+from memory_core import (
+    INDEX_FILE, KEBAB_RE, INDEX_LINK_RE, WIKILINK_RE, TOKEN_RE, STOPWORDS,
+    MIN_SHARED_TOKENS, STALE_MARKERS, LONG_ENTRY_CHARS, LONG_ENTRY_BYTES,
+    INDEX_LINE_LIMIT, INDEX_BYTE_LIMIT,
+    parse_frontmatter, inventory_files, _norm_link, build_inbound_links,
+    _has_memory, resolve_memory_dir,
+)
 
 
 def parse_index(text):
@@ -108,31 +50,6 @@ def parse_index(text):
     }
 
 
-def inventory_files(memory_dir):
-    memory_dir = Path(memory_dir)
-    files = []
-    for p in sorted(memory_dir.glob("*.md")):
-        if p.name == INDEX_FILE:
-            continue
-        text = p.read_text(encoding="utf-8", errors="replace")
-        fm = parse_frontmatter(text)
-        stale = sorted({mk for mk in STALE_MARKERS if mk in text.upper()})
-        files.append({
-            "filename": p.name,
-            "name": fm["name"] or p.stem,
-            "path": str(p),
-            "bytes": len(text.encode("utf-8")),
-            "type": fm["type"],
-            "schema_variant": fm["schema_variant"],
-            "name_style": fm["name_style"],
-            "description": fm["description"],
-            "stale_markers": stale,
-            "warnings": fm["warnings"],
-            "body": text,
-        })
-    return files
-
-
 def reconcile(index, files):
     file_names = {f["filename"] for f in files}
     referenced = set()
@@ -144,12 +61,6 @@ def reconcile(index, files):
             orphans.append({"target": e["target"], "line": e["line"]})
     unindexed = sorted(fn for fn in file_names if fn not in referenced)
     return {"orphans": orphans, "unindexed": unindexed}
-
-
-def _norm_link(s):
-    """Normalize a wikilink target or filename stem for comparison:
-    lowercase, hyphens and underscores are equivalent."""
-    return s.strip().lower().replace("-", "_")
 
 
 def find_broken_links(files):
@@ -165,24 +76,6 @@ def find_broken_links(files):
             if _norm_link(target) not in known:
                 broken.append({"from": f["filename"], "to": target})
     return broken
-
-
-def build_inbound_links(files):
-    # Map each file to the survivors that reference it via [[wikilinks]] (resolved +
-    # normalized). Lets the skill see which retire-candidates are still linked, so a
-    # retire can unlink its referrers instead of leaving a dangling pointer.
-    name_to_file = {}
-    for f in files:
-        if f["name"]:
-            name_to_file[_norm_link(f["name"])] = f["filename"]
-        name_to_file[_norm_link(Path(f["filename"]).stem)] = f["filename"]
-    inbound = {}
-    for f in files:
-        for m in WIKILINK_RE.finditer(f.get("body", "")):
-            target = name_to_file.get(_norm_link(m.group(1).strip()))
-            if target and target != f["filename"]:
-                inbound.setdefault(target, set()).add(f["filename"])
-    return {k: sorted(v) for k, v in inbound.items()}
 
 
 def _tokens(*parts):
@@ -228,36 +121,6 @@ def cluster_duplicates(files, min_shared=MIN_SHARED_TOKENS):
                              "shared_tokens": sorted(common),
                              "type": fi.get("type")})
     return clusters
-
-
-def _has_memory(p):
-    return (p / INDEX_FILE).exists() or any(p.glob("*.md"))
-
-
-def resolve_memory_dir(arg=None):
-    """Resolve the active memory dir. Priority: explicit arg > settings.json
-    autoMemoryDirectory > cwd-slug heuristic. The skill normally passes --memory-dir
-    (it knows the path from the session); auto-resolution is a fallback."""
-    if arg:
-        p = Path(arg).expanduser()
-        if _has_memory(p):
-            return p
-        raise SystemExit(f"No memory store at --memory-dir: {p}")
-    settings = Path.home() / ".claude" / "settings.json"
-    if settings.exists():
-        try:
-            amd = json.loads(settings.read_text(encoding="utf-8")).get("autoMemoryDirectory")
-            if amd:
-                p = Path(os.path.expanduser(amd))
-                if p.exists() and _has_memory(p):
-                    return p
-        except (json.JSONDecodeError, OSError):
-            pass
-    slug = re.sub(r"[:\\/ ]", "-", str(Path.cwd()))
-    p = Path.home() / ".claude" / "projects" / slug / "memory"
-    if p.exists() and _has_memory(p):
-        return p
-    raise SystemExit("Could not locate a memory dir; pass --memory-dir explicitly.")
 
 
 def _majority(items):
